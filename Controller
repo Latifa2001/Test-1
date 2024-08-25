@@ -1,0 +1,661 @@
+using Microsoft.AspNetCore.Mvc;
+using System.Collections.Generic;
+using System.IO;
+using OfficeOpenXml;
+using RX.Models;
+using iTextSharp.text;
+using iTextSharp.text.pdf;
+using Newtonsoft.Json;
+using DocumentFormat.OpenXml.Packaging;
+using DocumentFormat.OpenXml.Drawing.Charts;
+using System.Reflection.PortableExecutable;
+using DocumentFormat.OpenXml;
+using DocumentFormat.OpenXml.Presentation;
+using DocumentFormat.OpenXml.Spreadsheet;
+using System.IO.Packaging;
+using static System.Runtime.InteropServices.JavaScript.JSType;
+
+namespace RX.Controllers
+{
+    public class ReportController : Controller
+    {
+        [HttpGet]
+        public IActionResult Index()
+        {
+            var reportJson = TempData["Report"] as string;
+            if (!string.IsNullOrEmpty(reportJson))
+            {
+                var report = JsonConvert.DeserializeObject<SeverityReport>(reportJson);
+                return View(report);
+            }
+
+            return View();
+        }
+
+        private Dictionary<string, string> LoadClassificationData()
+        {
+            var classificationData = new Dictionary<string, string>();
+
+            var filePath = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", "Alert_class.xlsx");
+
+            using (var package = new ExcelPackage(new FileInfo(filePath)))
+            {
+                var worksheet = package.Workbook.Worksheets[0];
+                var rowCount = worksheet.Dimension.Rows;
+
+                for (int row = 2; row <= rowCount; row++)
+                {
+                    string title = worksheet.Cells[row, 1].Text.Trim(); // Assuming title is in column 1
+                    string classification = worksheet.Cells[row, 2].Text.Trim(); // Assuming classification is in column 2
+
+                    if (!classificationData.ContainsKey(title))
+                    {
+                        classificationData.Add(title, classification);
+                    }
+                }
+            }
+
+            return classificationData;
+        }
+
+        private SeverityReport ProcessExcelFile(IFormFile excelFile, DateTime reportDate)
+        {
+            var fileExtension = Path.GetExtension(excelFile.FileName).ToLower();
+            var report = new SeverityReport { ReportDate = reportDate };
+            
+            ExcelPackage.LicenseContext = LicenseContext.NonCommercial;
+
+
+            if (fileExtension == ".csv")
+            {
+                using (var reader = new StreamReader(excelFile.OpenReadStream()))
+                {
+                    var csvData = new List<string[]>();
+                    int rowCount = 0;
+                    int colCount = 0;
+                    while (!reader.EndOfStream)
+                    {
+                        var line = reader.ReadLine();
+                        var values = line.Split(',');
+                        csvData.Add(values);
+                        rowCount = csvData.Count; // The number of rows
+                        colCount = rowCount > 0 ? csvData[0].Length : 0; // The number of columns
+                    }
+
+                    int severityCol = -1;
+                    int statusCol = -1;
+                    int titleCol = -1;
+
+                    // Check if there are rows and if the header row is present
+                    if (csvData.Count > 0)
+                    {
+                        // Get the header row
+                        var headers = csvData[0];
+
+                        // Iterate through the headers to find the column indices
+                        for (int col = 0; col < headers.Length; col++)
+                        {
+                            string header = headers[col].Trim().ToLower();
+                            if (header == "severity")
+                            {
+                                severityCol = col;
+                            }
+                            else if (header == "status")
+                            {
+                                statusCol = col;
+                            }
+                            else if (header == "title")
+                            {
+                                titleCol = col;
+                            }
+                        }
+                    }
+
+
+                    if (severityCol == -1 || statusCol == -1 || titleCol == -1)
+                    {
+                        throw new InvalidOperationException("The Excel file does not contain the required columns for Severity, Status, or Title.");
+                    }
+
+                    var classificationData = LoadClassificationData();
+                    var highAlertRootCauses = LoadHighAlertRootCauses();
+
+                    for (int row = 1; row < rowCount; row++) // Start from 1 to skip header row
+                    {
+                        // Retrieve the row data from the csvData list
+                        var rowData = csvData[row];
+
+                        string severity = rowData[severityCol].Trim();
+                        string status = rowData[statusCol].Trim();
+                        string title = rowData[titleCol].Trim();
+
+                        switch (severity.ToLower())
+                        {
+                            case "high":
+                                report.HighSeverityCount++;
+                                if (!report.HighSeverityTitles.Contains(title))
+                                    report.HighSeverityTitles.Add(title);
+
+                                if (highAlertRootCauses.TryGetValue(title, out var rootCause))
+                                {
+                                    report.HighSeverityRootCauses[title] = rootCause;
+                                }
+                                break;
+                            case "medium":
+                                report.MediumSeverityCount++;
+                                break;
+                            case "low":
+                                report.LowSeverityCount++;
+                                break;
+                            case "informational":
+                                report.InformationalSeverityCount++;
+                                break;
+                        }
+
+                        switch (status.ToLower())
+                        {
+                            case "closed":
+                                report.ClosedStatusCount++;
+                                break;
+                            case "active":
+                                report.ActiveStatusCount++;
+                                break;
+                        }
+
+                        report.TotalRows++;
+
+                        if (classificationData.TryGetValue(title, out var classification))
+                        {
+                            if (report.ClassificationCounts.ContainsKey(classification))
+                            {
+                                report.ClassificationCounts[classification]++;
+                            }
+                            else
+                            {
+                                report.ClassificationCounts[classification] = 1;
+                            }
+
+                            if (!report.ClassificationSeverities.ContainsKey(classification))
+                            {
+                                report.ClassificationSeverities[classification] = new HashSet<string>();
+                            }
+                            report.ClassificationSeverities[classification].Add(severity);
+                        }
+                    }
+
+                }
+            }
+            // Handle Excel files (.xlsx or .xlsm)
+            else if (fileExtension == ".xlsx" || fileExtension == ".xlsm")
+            {
+                using (var stream = new MemoryStream())
+                {
+                    excelFile.CopyTo(stream);
+                    using (var package = new ExcelPackage(stream))
+                    {
+                        var worksheet = package.Workbook.Worksheets[0];
+                        var rowCount = worksheet.Dimension.Rows;
+                        var colCount = worksheet.Dimension.Columns;
+
+                        int severityCol = -1;
+                        int statusCol = -1;
+                        int titleCol = -1;
+
+                        for (int col = 1; col <= colCount; col++)
+                        {
+                            string header = worksheet.Cells[1, col].Text.Trim().ToLower();
+                            if (header == "severity")
+                            {
+                                severityCol = col;
+                            }
+                            else if (header == "status")
+                            {
+                                statusCol = col;
+                            }
+                            else if (header == "title")
+                            {
+                                titleCol = col;
+                            }
+                        }
+
+                        if (severityCol == -1 || statusCol == -1 || titleCol == -1)
+                        {
+                            throw new InvalidOperationException("The Excel file does not contain the required columns for Severity, Status, or Title.");
+                        }
+
+                        var classificationData = LoadClassificationData();
+                        var highAlertRootCauses = LoadHighAlertRootCauses();
+
+                        for (int row = 2; row <= rowCount; row++)
+                        {
+                            string severity = worksheet.Cells[row, severityCol].Text.Trim();
+                            string status = worksheet.Cells[row, statusCol].Text.Trim();
+                            string title = worksheet.Cells[row, titleCol].Text.Trim();
+
+                            switch (severity.ToLower())
+                            {
+                                case "high":
+                                    report.HighSeverityCount++;
+                                    if (!report.HighSeverityTitles.Contains(title))
+                                        report.HighSeverityTitles.Add(title);
+
+                                    if (highAlertRootCauses.TryGetValue(title, out var rootCause))
+                                    {
+                                        report.HighSeverityRootCauses[title] = rootCause;
+                                    }
+                                    break;
+                                case "medium":
+                                    report.MediumSeverityCount++;
+                                    break;
+                                case "low":
+                                    report.LowSeverityCount++;
+                                    break;
+                                case "informational":
+                                    report.InformationalSeverityCount++;
+                                    break;
+                            }
+
+                            switch (status.ToLower())
+                            {
+                                case "closed":
+                                    report.ClosedStatusCount++;
+                                    break;
+                                case "active":
+                                    report.ActiveStatusCount++;
+                                    break;
+                            }
+
+                            report.TotalRows++;
+
+                            if (classificationData.TryGetValue(title, out var classification))
+                            {
+                                if (report.ClassificationCounts.ContainsKey(classification))
+                                {
+                                    report.ClassificationCounts[classification]++;
+                                }
+                                else
+                                {
+                                    report.ClassificationCounts[classification] = 1;
+                                }
+
+                                if (!report.ClassificationSeverities.ContainsKey(classification))
+                                {
+                                    report.ClassificationSeverities[classification] = new HashSet<string>();
+                                }
+                                report.ClassificationSeverities[classification].Add(severity);
+                            }
+                        }
+                    }
+                }
+            }
+
+            return report;
+        }
+
+        private Dictionary<string, string> LoadHighAlertRootCauses()
+        {
+            var rootCauseData = new Dictionary<string, string>();
+
+            var filePath = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", "High_alert_Root.xlsx");
+
+            using (var package = new ExcelPackage(new FileInfo(filePath)))
+            {
+                var worksheet = package.Workbook.Worksheets[0];
+                var rowCount = worksheet.Dimension.Rows;
+
+                for (int row = 2; row <= rowCount; row++)
+                {
+                    string title = worksheet.Cells[row, 1].Text.Trim(); // Assuming title is in column 1
+                    string rootCause = worksheet.Cells[row, 2].Text.Trim(); // Assuming root cause is in column 2
+
+                    if (!rootCauseData.ContainsKey(title))
+                    {
+                        rootCauseData.Add(title, rootCause);
+                    }
+                }
+            }
+
+            return rootCauseData;
+        }
+
+
+
+        // Implement methods for downloading PowerPoint and PDF files here...
+        [HttpPost]
+        public IActionResult UploadExcel(IFormFile excelFile, DateTime reportDate)
+        {
+            if (excelFile == null || excelFile.Length == 0)
+            {
+                ModelState.AddModelError("", "No file uploaded.");
+                return View("Index");
+            }
+
+            var report = ProcessExcelFile(excelFile, reportDate);
+
+            // Serialize the report to JSON and store it in TempData
+            TempData["Report"] = JsonConvert.SerializeObject(report);
+            var reportJson = JsonConvert.SerializeObject(report);
+
+            Console.WriteLine("Serialized Report: " + reportJson); // Debugging
+            HttpContext.Session.SetString("Report", reportJson);
+
+            return RedirectToAction("Index");
+        }
+
+        public IActionResult EditAndDownloadPowerPoint(DateTime userDate, int lowCount, int mediumCount, int highCount, int informationalCount, int activeCount, int closedCount,
+            string lowCategories, string mediumCategories, string highCategories, string informationalCategories)
+        {
+            var reportJson = HttpContext.Session.GetString("Report");
+
+            if (string.IsNullOrEmpty(reportJson))
+            {
+                return RedirectToAction("Index");
+            }
+
+            var report = JsonConvert.DeserializeObject<SeverityReport>(reportJson);
+            if (report == null)
+            {
+                return RedirectToAction("Index");
+            }
+
+            string templatePath = Path.Combine("wwwroot", "Sample.pptx");
+            string outputFilePath = Path.Combine("wwwroot", "EditedSample.pptx");
+
+            // Copy the template to the output file before opening
+            System.IO.File.Copy(templatePath, outputFilePath, true);
+
+            string formattedDate = report.ReportDate.ToString("dd MMM yyyy");
+            //string daySuffix;
+            //int day = report.ReportDate.Day;
+
+            //if (day % 10 == 1 && day % 100 != 11)
+            //    daySuffix = "st";
+            //else if (day % 10 == 2 && day % 100 != 12)
+            //    daySuffix = "nd";
+            //else if (day % 10 == 3 && day % 100 != 13)
+            //    daySuffix = "rd";
+            //else
+            //    daySuffix = "th";
+            //string formattedDate2 = report.ReportDate.ToString($"MMM {day}{daySuffix}");
+
+            using (PresentationDocument presentationDocument = PresentationDocument.Open(outputFilePath, true))
+            {
+                foreach (var slidePart in presentationDocument.PresentationPart.SlideParts)
+                {
+                    // Existing text replacements
+                    ReplaceTextInSlide(slidePart, "Date-1", formattedDate);
+                    //ReplaceTextInSlide(slidePart, "Date-2", formattedDate2);
+                    ReplaceTextInSlide(slidePart, "Low-1", report.LowSeverityCount.ToString());
+                    ReplaceTextInSlide(slidePart, "Medium-1", report.MediumSeverityCount.ToString());
+                    ReplaceTextInSlide(slidePart, "High-1", report.HighSeverityCount.ToString());
+                    ReplaceTextInSlide(slidePart, "Informational-1", report.InformationalSeverityCount.ToString());
+                    ReplaceTextInSlide(slidePart, "Active-1", report.ActiveStatusCount.ToString());
+                    ReplaceTextInSlide(slidePart, "Closed-1", report.ClosedStatusCount.ToString());
+                    ReplaceTextInSlide(slidePart, "Total-1", report.TotalRows.ToString());
+
+                    ReplaceTextInSlide(slidePart, "L-1-cat", FormatCategoryList(report, "Low"));
+                    ReplaceTextInSlide(slidePart, "M-1-cat", FormatCategoryList(report, "Medium"));
+                    ReplaceTextInSlide(slidePart, "H-1-cat", FormatCategoryList(report, "High"));
+                    ReplaceTextInSlide(slidePart, "I-1-cat", FormatCategoryList(report, "Informational"));
+
+                    ReplaceTextInSlide(slidePart, "Z-1", GetCategoryCount(report, "Zscaler").ToString());
+                    ReplaceTextInSlide(slidePart, "C-1", GetCategoryCount(report, "Compliance Manager").ToString());
+                    ReplaceTextInSlide(slidePart, "Em-1", GetCategoryCount(report, "Email").ToString());
+                    ReplaceTextInSlide(slidePart, "Ac-1", GetCategoryCount(report, "Access").ToString());
+                    ReplaceTextInSlide(slidePart, "Au-1", GetCategoryCount(report, "Audit").ToString());
+                    ReplaceTextInSlide(slidePart, "En-1", GetCategoryCount(report, "Endpoint").ToString());
+                    ReplaceTextInSlide(slidePart, "D-1", GetCategoryCount(report, "DLP").ToString());
+                    ReplaceTextInSlide(slidePart, "BP-1", GetCategoryCount(report, "Brand Protection").ToString());
+                    ReplaceTextInSlide(slidePart, "W-1", GetCategoryCount(report, "Web").ToString());
+                    ReplaceTextInSlide(slidePart, "N-1", GetCategoryCount(report, "Network").ToString());
+
+                    // Update charts in the slide
+                    foreach (var chartPart in slidePart.ChartParts)
+                    {
+                        var chartTitle = chartPart.ChartSpace.Descendants<DocumentFormat.OpenXml.Drawing.Charts.Title>().FirstOrDefault();
+
+                        if (chartTitle != null)
+                        {
+                            string titleText = chartTitle.ChartText.InnerText;
+
+                            int categoryCount = 0;
+                            int otherCount = report.TotalRows;
+
+                            if (titleText.Equals("INFORMATIONAL", StringComparison.OrdinalIgnoreCase))
+                            {
+                                categoryCount = report.InformationalSeverityCount;
+                            }
+                            else if (titleText.Equals("LOW", StringComparison.OrdinalIgnoreCase))
+                            {
+                                categoryCount = report.LowSeverityCount;
+                            }
+                            else if (titleText.Equals("MEDIUM", StringComparison.OrdinalIgnoreCase))
+                            {
+                                categoryCount = report.MediumSeverityCount;
+                            }
+                            else if (titleText.Equals("HIGH", StringComparison.OrdinalIgnoreCase))
+                            {
+                                categoryCount = report.HighSeverityCount;
+                            }
+
+                            // Check if it's the stacked bar chart
+                            if (titleText.Equals("Status", StringComparison.OrdinalIgnoreCase)) // Replace with your actual title
+                            {
+                                //UpdateStackedBarChart(chartPart, report);
+                            }
+
+                            // Update the doughnut chart values
+                            otherCount -= categoryCount;
+
+                            var valueElements = chartPart.ChartSpace.Descendants<DocumentFormat.OpenXml.Drawing.Charts.NumericValue>().ToList();
+                            if (valueElements != null && valueElements.Count >= 2)
+                            {
+                                // Set the value for the first data point (B2)
+                                valueElements[3].Text = categoryCount.ToString();
+
+                                // Set the value for the second data point (B3)
+                                valueElements[4].Text = otherCount.ToString();
+                            }
+
+                            // Save the chart part with the updated values
+                            chartPart.ChartSpace.Save();
+                        }
+                    }
+
+                    //Update High Alerts:
+                    var slideTitle2 = slidePart.Slide.Descendants<DocumentFormat.OpenXml.Drawing.Paragraph>()
+                        .FirstOrDefault(p => p.InnerText.StartsWith("HIGH SEVERITY ALERTS SPOTLIGHT", StringComparison.OrdinalIgnoreCase));
+
+                    if (slideTitle2 != null)
+                    {
+                        // Remove duplicates and prepare the titles and root causes
+                        var highSeverityTitles = report.HighSeverityTitles.Distinct().ToList();
+                        var highSeverityRootCauses = highSeverityTitles
+                            .Where(title => report.HighSeverityRootCauses.ContainsKey(title))
+                            .Select(title => report.HighSeverityRootCauses[title])
+                            .ToList();
+
+                        // Create a text box on the left for the titles
+                        AddStyledTextBoxToSlide(slidePart, highSeverityTitles, highSeverityRootCauses);
+
+                        //// Create a text box on the right for the root causes
+                        //AddTextBoxToSlide(slidePart, highSeverityRootCauses, "Right");
+                    }
+                }
+
+                presentationDocument.PresentationPart.Presentation.Save();  // Ensure entire presentation is saved
+            }
+
+            byte[] fileBytes = System.IO.File.ReadAllBytes(outputFilePath);
+            return File(fileBytes, "application/vnd.openxmlformats-officedocument.presentationml.presentation", "EditedSample.pptx");
+        }
+
+        private void AddStyledTextBoxToSlide(SlidePart slidePart, List<string> highSeverityTitles, List<string> highSeverityRootCauses)
+        {
+            var slide = slidePart.Slide;
+            var shapeTree = slide.CommonSlideData.ShapeTree;
+
+            // Position and dimension for high severity titles (left side)
+            long leftXPosition = 342900L;
+            long leftYPosition = 1714500L;
+            long leftWidth = 3429000L;
+            long leftHeight = 4857750L;
+
+            // Position and dimension for root causes (right side)
+            long rightXPosition = 5715000L;
+            long rightYPosition = 1714500L;
+            long rightWidth = 3429000L;
+            long rightHeight = 4857750L;
+
+            // Add High Severity Titles on the left
+            AddTextBox(slide, highSeverityTitles, leftXPosition, leftYPosition, leftWidth, leftHeight, 20);
+
+            // Add Root Causes on the right
+            var rootCauseContent = highSeverityRootCauses
+                .Select(rc => $"{rc}")
+                .ToList();
+            AddTextBox(slide, rootCauseContent, rightXPosition, rightYPosition, rightWidth, rightHeight, 14, 16, true);
+        }
+
+        private void AddTextBox(Slide slide, List<string> contentList, long xPosition, long yPosition, long width, long height, int fontSize, int headerFontSize = 16, bool boldHeaders = false)
+        {
+            var shapeTree = slide.CommonSlideData.ShapeTree;
+
+            // Create a new shape for the text box
+            var newShape = new DocumentFormat.OpenXml.Presentation.Shape();
+
+            // Set the shape properties
+            newShape.NonVisualShapeProperties = new DocumentFormat.OpenXml.Presentation.NonVisualShapeProperties(
+                new DocumentFormat.OpenXml.Presentation.NonVisualDrawingProperties() { Id = (UInt32Value)1001U, Name = "TextBox" },
+                new DocumentFormat.OpenXml.Presentation.NonVisualShapeDrawingProperties(new DocumentFormat.OpenXml.Drawing.ShapeLocks() { NoGrouping = true }),
+                new DocumentFormat.OpenXml.Presentation.ApplicationNonVisualDrawingProperties(new DocumentFormat.OpenXml.Presentation.PlaceholderShape()));
+
+            newShape.ShapeProperties = new DocumentFormat.OpenXml.Presentation.ShapeProperties();
+
+            // Define the position and size of the text box
+            newShape.ShapeProperties.Transform2D = new DocumentFormat.OpenXml.Drawing.Transform2D(
+                new DocumentFormat.OpenXml.Drawing.Offset() { X = xPosition, Y = yPosition },
+                new DocumentFormat.OpenXml.Drawing.Extents() { Cx = width, Cy = height });
+
+            // Add the text body and paragraph elements
+            newShape.TextBody = new DocumentFormat.OpenXml.Presentation.TextBody(
+                new DocumentFormat.OpenXml.Drawing.BodyProperties(),
+                new DocumentFormat.OpenXml.Drawing.ListStyle());
+
+            foreach (var item in contentList)
+            {
+                var paragraph = new DocumentFormat.OpenXml.Drawing.Paragraph();
+
+                // Add "Root Cause" and "Resolution" in bold if required
+                if (boldHeaders)
+                {
+                    var runHeader = new DocumentFormat.OpenXml.Drawing.Run(
+                        new DocumentFormat.OpenXml.Drawing.RunProperties()
+                        {
+                            FontSize = headerFontSize * 100,
+                            Bold = true
+                        },
+                        new DocumentFormat.OpenXml.Drawing.Text() { Text = "• Root Cause\n" });
+                    paragraph.Append(runHeader);
+
+                    var runContent = new DocumentFormat.OpenXml.Drawing.Run(
+                        new DocumentFormat.OpenXml.Drawing.RunProperties()
+                        {
+                            FontSize = fontSize * 100
+                        },
+                        new DocumentFormat.OpenXml.Drawing.Text() { Text = item });
+                    paragraph.Append(runContent);
+
+                    var runHeader2 = new DocumentFormat.OpenXml.Drawing.Run(
+                        new DocumentFormat.OpenXml.Drawing.RunProperties()
+                        {
+                            FontSize = headerFontSize * 100,
+                            Bold = true
+                        },
+                        new DocumentFormat.OpenXml.Drawing.Text() { Text = "\n\n• Resolution\n\n" });
+                    paragraph.Append(runHeader2);
+
+                }
+                else
+                {
+                    var runContent = new DocumentFormat.OpenXml.Drawing.Run(
+                        new DocumentFormat.OpenXml.Drawing.RunProperties()
+                        {
+                            FontSize = fontSize * 100
+                        },
+                        new DocumentFormat.OpenXml.Drawing.Text() { Text = item + "\n\n" });
+                    paragraph.Append(runContent);
+                }
+
+                newShape.TextBody.AppendChild(paragraph);
+            }
+
+            shapeTree.AppendChild(newShape);
+        }
+
+        // Function to update stacked bar chart data
+        //private void UpdateStackedBarChart(ChartPart chartPart, SeverityReport report)
+        //{
+        //    var categoryNames = new[] { "Zscaler", "Compliance Manager", "Email", "Access", "Audit", "Endpoint", "DLP", "Brand Protection", "Web", "Network" };
+        //    var totalRowsCount = report.TotalRows;
+
+        //    // Retrieve the chart's categories and values
+        //    var categoryData = chartPart.ChartSpace.Descendants<CategoryAxisData>().FirstOrDefault();
+        //    var valueData = chartPart.ChartSpace.Descendants<Values>().ToList();
+
+        //    if (categoryData != null && valueData.Count >= 2)
+        //    {
+        //        var categoryElements = categoryData.Descendants<StringPoint>().ToList();
+        //        var valueElementsForB = valueData[0].Descendants<NumericValue>().ToList(); // Column B data
+        //        var valueElementsForC = valueData[1].Descendants<NumericValue>().ToList(); // Column C data
+
+        //        for (int i = 0; i < categoryNames.Length; i++)
+        //        {
+        //            var category = categoryNames[i];
+        //            var categoryCount = report.ClassificationCounts.ContainsKey(category) ? report.ClassificationCounts[category] : 0;
+        //            var otherCount = totalRowsCount - categoryCount;
+
+        //            if (i < valueElementsForC.Count && i < valueElementsForB.Count)
+        //            {
+        //                valueElementsForC[i].Text = categoryCount.ToString();
+        //                valueElementsForB[i].Text = otherCount.ToString();
+        //            }
+        //        }
+        //    }
+
+        //    chartPart.ChartSpace.Save();
+        //}
+
+        private int GetCategoryCount(SeverityReport report, string category)
+        {
+            return report.ClassificationCounts.ContainsKey(category) ? report.ClassificationCounts[category] : 0;
+        }
+
+        private void ReplaceTextInSlide(SlidePart slidePart, string placeholder, string newValue)
+        {
+            var paragraphs = slidePart.Slide.Descendants<DocumentFormat.OpenXml.Drawing.Paragraph>();
+
+            foreach (var paragraph in paragraphs)
+            {
+                foreach (var text in paragraph.Descendants<DocumentFormat.OpenXml.Drawing.Text>())
+                {
+                    if (text.Text.Contains(placeholder))
+                    {
+                        text.Text = text.Text.Replace(placeholder, newValue);
+                    }
+                }
+            }
+        }
+
+        private string FormatCategoryList(SeverityReport report, string severity)
+        {
+            var categories = report.ClassificationSeverities
+                .Where(kvp => kvp.Value.Contains(severity))
+                .Select(kvp => kvp.Key)
+                .OrderBy(c => c)
+                .ToList();
+
+            return string.Join("\n", categories.Select(c => $"• {c}"));
+        }
+    }
+}
